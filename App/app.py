@@ -6,18 +6,35 @@ import subprocess
 import cv2
 import numpy as np
 import imageio_ffmpeg
+from mtcnn import MTCNN
 from ultralytics import YOLO
-from flask import Flask, request, render_template, send_from_directory, jsonify
-from werkzeug.utils import secure_filename
-import uuid
-import threading
+from flask import Flask
 from tensorflow.keras.models import load_model
+from tensorflow.keras.applications.efficientnet import preprocess_input
+import keras.src.layers.normalization.batch_normalization as _bn_module
+
+import sys
 
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
+    datefmt='%Y-%m-%d %H:%M:%S',
+    stream=sys.stderr
 )
+
+# Monkey-patch BatchNormalization to accept legacy renorm kwargs
+_OrigBN = _bn_module.BatchNormalization
+_orig_bn_init = _OrigBN.__init__
+
+
+def _patched_bn_init(self, *args, **kwargs):
+    kwargs.pop('renorm', None)
+    kwargs.pop('renorm_clipping', None)
+    kwargs.pop('renorm_momentum', None)
+    _orig_bn_init(self, *args, **kwargs)
+
+
+_OrigBN.__init__ = _patched_bn_init
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
@@ -32,9 +49,15 @@ MODEL_PATH = os.path.join(os.path.dirname(__file__), '..', 'tmp_checkpoint', 'be
 logger.info('Loading model from %s', MODEL_PATH)
 model = load_model(MODEL_PATH)
 logger.info('Model loaded successfully')
-INPUT_SIZE = 128
+INPUT_SIZE = 224
+MIN_FACE_SIZE = 90  # same as 02-prepare_fake_real_dataset.py
 
-# Initialize YOLO face detector
+# Initialize MTCNN face detector (same as training pipeline 01-crop_faces_with_mtcnn.py)
+logger.info('Initializing MTCNN face detector')
+mtcnn_detector = MTCNN()
+logger.info('MTCNN face detector ready')
+
+# Initialize YOLO face detector (for processed video overlay only)
 logger.info('Initializing YOLO face detector')
 FACE_MODEL_PATH = os.path.join(os.path.dirname(__file__), 'yolov8n-face.pt')
 face_detector = YOLO(FACE_MODEL_PATH)
@@ -82,7 +105,26 @@ def reencode_to_h264(input_path, output_path=None):
     return True
 
 
+def scale_frame(frame):
+    """Scale frame exactly like 00-convert_video_to_image.py"""
+    h, w = frame.shape[:2]
+    if w < 300:
+        scale_ratio = 2
+    elif w > 1900:
+        scale_ratio = 0.33
+    elif w > 1000:
+        scale_ratio = 0.5
+    else:
+        scale_ratio = 1
+    if scale_ratio != 1:
+        new_w = int(w * scale_ratio)
+        new_h = int(h * scale_ratio)
+        frame = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    return frame
+
+
 def extract_faces_from_video(video_path):
+    """Extract faces using MTCNN — matching training pipeline (01-crop_faces_with_mtcnn.py)."""
     logger.info('Extracting faces from video: %s', video_path)
     faces = []
     cap = cv2.VideoCapture(video_path)
@@ -98,21 +140,31 @@ def extract_faces_from_video(video_path):
         if not ret:
             break
         if frame_id % math.floor(frame_rate) == 0:
+            # Step 1: Scale frame (same as 00-convert_video_to_image.py)
+            frame = scale_frame(frame)
             image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             h, w = image_rgb.shape[:2]
-            results = face_detector(frame, verbose=False)[0]
-            for box in results.boxes:
-                if box.conf[0] > 0.5:
-                    bx1, by1, bx2, by2 = map(int, box.xyxy[0])
-                    bw = bx2 - bx1
-                    bh = by2 - by1
-                    margin_x = int(bw * 0.3)
-                    margin_y = int(bh * 0.3)
-                    x1 = max(0, bx1 - margin_x)
-                    x2 = min(w, bx2 + margin_x)
-                    y1 = max(0, by1 - margin_y)
-                    y2 = min(h, by2 + margin_y)
+
+            # Step 2: MTCNN face detection (same as 01-crop_faces_with_mtcnn.py)
+            results = mtcnn_detector.detect_faces(image_rgb)
+            num_faces = len(results)
+
+            for result in results:
+                bounding_box = result['box']
+                confidence = result['confidence']
+                # Same logic as training: if single face keep it, if multiple only keep > 0.95
+                if num_faces < 2 or confidence > 0.95:
+                    bx, by, bw, bh = bounding_box
+                    margin_x = bw * 0.3
+                    margin_y = bh * 0.3
+                    x1 = int(max(0, bx - margin_x))
+                    x2 = int(min(w, bx + bw + margin_x))
+                    y1 = int(max(0, by - margin_y))
+                    y2 = int(min(h, by + bh + margin_y))
                     crop = image_rgb[y1:y2, x1:x2]
+                    # Step 3: Filter small faces (same as 02-prepare_fake_real_dataset.py MIN_IMAGE_SIZE=90)
+                    if crop.shape[0] < MIN_FACE_SIZE or crop.shape[1] < MIN_FACE_SIZE:
+                        continue
                     if crop.size > 0:
                         crop_resized = cv2.resize(crop, (INPUT_SIZE, INPUT_SIZE))
                         faces.append(crop_resized)
@@ -123,78 +175,76 @@ def extract_faces_from_video(video_path):
 
 
 def create_processed_video(video_path, output_path, face_scores=None):
-    """Re-encode video with face bounding boxes and per-face REAL/FAKE label."""
+    """Create video with face bounding boxes using ffmpeg drawbox (much faster than OpenCV)."""
     logger.info('Creating processed video with bounding boxes: %s', output_path)
 
     cap = cv2.VideoCapture(video_path)
     fps = cap.get(cv2.CAP_PROP_FPS) or 30
-    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    duration = total_frames / fps if fps > 0 else 0
 
-    # Write to a temp file with mp4v codec first
-    temp_path = output_path + '.tmp.mp4'
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    out = cv2.VideoWriter(temp_path, fourcc, fps, (w, h))
+    # Sample a few frames spread across the video to detect faces
+    sample_count = min(5, max(1, int(duration)))  # ~1 sample per second, max 5
+    sample_positions = [int(i * total_frames / sample_count) for i in range(sample_count)]
 
-    if not out.isOpened():
-        logger.error('VideoWriter failed to open: %s', temp_path)
-        cap.release()
-        return
-
-    frame_count = 0
-    while cap.isOpened():
+    # Collect all face boxes across sampled frames
+    all_boxes = []
+    for pos in sample_positions:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, pos)
         ret, frame = cap.read()
         if not ret:
-            break
-        image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            continue
         results = face_detector(frame, verbose=False)[0]
         for box in results.boxes:
             if box.conf[0] > 0.5:
                 bx1, by1, bx2, by2 = map(int, box.xyxy[0])
-                bw = bx2 - bx1
-                bh = by2 - by1
-                x, y = max(0, bx1), max(0, by1)
-
-                # Crop and predict this face individually
-                margin_x = int(bw * 0.3)
-                margin_y = int(bh * 0.3)
-                x1 = max(0, bx1 - margin_x)
-                x2 = min(w, bx2 + margin_x)
-                y1 = max(0, by1 - margin_y)
-                y2 = min(h, by2 + margin_y)
-                crop = image_rgb[y1:y2, x1:x2]
-                if crop.size > 0:
-                    crop_resized = cv2.resize(crop, (INPUT_SIZE, INPUT_SIZE))
-                    face_input = np.array([crop_resized], dtype='float32') / 255.0
-                    score = float(model.predict(face_input, verbose=0)[0][0])
-                else:
-                    score = 0.0
-
-                is_real = score > 0.5
-                label = 'REAL' if is_real else 'FAKE'
-                color = (0, 255, 0) if is_real else (0, 0, 255)
-                cv2.rectangle(frame, (x, y), (bx2, by2), color, 2)
-                text = f'{label} {score:.2f}'
-                cv2.putText(frame, text, (x, y - 10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
-        out.write(frame)
-        frame_count += 1
+                all_boxes.append((max(0, bx1), max(0, by1), bx2, by2))
 
     cap.release()
-    out.release()
-    logger.info('Wrote %d frames to temp file, re-encoding to H.264', frame_count)
 
-    # Re-encode to H.264 for browser compatibility
-    if reencode_to_h264(temp_path, output_path):
-        logger.info('Processed video saved (H.264): %s', output_path)
+    # Build ffmpeg drawbox filter from detected boxes
+    ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+    if all_boxes:
+        # Use the most common box region (largest by area) for a stable overlay
+        # Deduplicate similar boxes by averaging nearby ones
+        unique_boxes = []
+        for box in all_boxes:
+            merged = False
+            for i, ub in enumerate(unique_boxes):
+                # If boxes overlap significantly, merge them
+                if (abs(box[0] - ub[0]) < 40 and abs(box[1] - ub[1]) < 40 and
+                        abs(box[2] - ub[2]) < 40 and abs(box[3] - ub[3]) < 40):
+                    unique_boxes[i] = (
+                        (ub[0] + box[0]) // 2, (ub[1] + box[1]) // 2,
+                        (ub[2] + box[2]) // 2, (ub[3] + box[3]) // 2
+                    )
+                    merged = True
+                    break
+            if not merged:
+                unique_boxes.append(box)
+
+        drawbox_filters = []
+        for (x1, y1, x2, y2) in unique_boxes:
+            w = x2 - x1
+            h = y2 - y1
+            drawbox_filters.append(f"drawbox=x={x1}:y={y1}:w={w}:h={h}:color=green:t=2")
+        filter_str = ','.join(drawbox_filters)
     else:
-        logger.error('Failed to re-encode processed video')
+        filter_str = 'null'
 
-    # Clean up temp file
-    try:
-        os.remove(temp_path)
-    except OSError:
-        pass
+    cmd = [
+        ffmpeg_exe, '-y', '-i', video_path,
+        '-vf', filter_str,
+        '-c:v', 'libx264', '-preset', 'fast',
+        '-movflags', '+faststart', '-pix_fmt', 'yuv420p',
+        output_path
+    ]
+    logger.info('Running ffmpeg with %d face boxes', len(all_boxes))
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        logger.error('ffmpeg drawbox failed: %s', result.stderr[-500:])
+    else:
+        logger.info('Processed video saved: %s', output_path)
 
 
 def predict_deepfake(faces):
@@ -204,16 +254,31 @@ def predict_deepfake(faces):
 
     logger.info('Running prediction on %d face(s)', len(faces))
 
-    face_array = np.array(faces, dtype='float32') / 255.0
+    face_array = preprocess_input(np.array(faces, dtype='float32'))
     predictions = model.predict(face_array, verbose=0)
-    avg_prediction = float(np.mean(predictions))
+    flat_preds = predictions.flatten()
+    # Use top-K mean: average the top 30% of predictions (at least 3)
+    # Rationale: real videos have many high-confidence real frames; fake videos have NONE
+    sorted_desc = np.sort(flat_preds)[::-1]  # highest first
+    k = max(3, int(len(sorted_desc) * 0.3))
+    top_k = sorted_desc[:k]
+    avg_prediction = float(np.mean(top_k))
+    # Write diagnostics to file
+    diag_path = os.path.join(os.path.dirname(__file__), 'diag_log.txt')
+    with open(diag_path, 'a') as f:
+        f.write(f'Raw predictions: min={float(np.min(predictions)):.4f}, max={float(np.max(predictions)):.4f}, top{k}_mean={avg_prediction:.4f}, mean={float(np.mean(predictions)):.4f}\n')
+        f.write(f'All scores (sorted desc): {sorted_desc.tolist()}\n')
+        f.write(f'Top-{k} used: {top_k.tolist()}\n')
+        f.write(f'Num faces: {len(faces)}\n\n')
+    logger.info('Raw predictions: min=%.4f, max=%.4f, top%d_mean=%.4f, mean=%.4f, n=%d',
+                float(np.min(predictions)), float(np.max(predictions)),
+                k, avg_prediction, float(np.mean(flat_preds)), len(flat_preds))
 
-    # Build per-face details (up to 3 evenly spaced faces)
-    total = len(faces)
-    if total <= 3:
-        indices = list(range(total))
-    else:
-        indices = [0, total // 2, total - 1]
+    # Build per-face details (up to 5 faces sorted by relevance)
+    is_real = avg_prediction > 0.5
+    # Sort face indices by score: highest first for REAL, lowest first for FAKE
+    sorted_indices = np.argsort(flat_preds)[::-1] if is_real else np.argsort(flat_preds)
+    indices = sorted_indices[:5].tolist()
 
     faces_detail = []
     for i in indices:
@@ -222,8 +287,8 @@ def predict_deepfake(faces):
             'score': float(predictions[i][0])
         })
 
-    logger.info('Prediction complete — avg score: %.4f, faces: %d', avg_prediction, total)
-    return avg_prediction, total, faces_detail
+    logger.info('Prediction complete — avg score: %.4f, faces: %d', avg_prediction, len(faces))
+    return avg_prediction, len(faces), faces_detail
 
 
 def cleanup_old_uploads(exclude=None):
@@ -239,109 +304,10 @@ def cleanup_old_uploads(exclude=None):
                 pass
 
 
-@app.route('/', methods=['GET'])
-def index():
-    return render_template('index.html')
-
-
-@app.route('/uploads/<filename>')
-def uploaded_video(filename):
-    return send_from_directory(app.config['UPLOAD_FOLDER'], filename, mimetype='video/mp4')
-
-
-def process_video_job(job_id, filepath, unique_name):
-    """Background worker: extract faces, predict, create processed video."""
-    try:
-        logger.info('[Job %s] Starting face detection', job_id)
-        jobs[job_id]['status'] = 'detecting'
-
-        faces = extract_faces_from_video(filepath)
-        avg_score, num_faces, faces_detail = predict_deepfake(faces)
-
-        if avg_score is None:
-            logger.warning('[Job %s] No faces detected', job_id)
-            jobs[job_id].update({
-                'status': 'done',
-                'error': 'No faces detected in the video.',
-                'video_url': f'/uploads/{unique_name}',
-            })
-            return
-
-        is_real = avg_score > 0.5
-        label = 'REAL' if is_real else 'FAKE'
-        confidence = avg_score if is_real else (1 - avg_score)
-
-        # Publish detection results immediately
-        logger.info('[Job %s] Detection done — result: %s, confidence: %.2f%%, faces: %d',
-                    job_id, label, confidence * 100, num_faces)
-        jobs[job_id].update({
-            'status': 'processing_video',
-            'result': label,
-            'confidence': round(confidence * 100, 2),
-            'score': round(avg_score, 4),
-            'num_faces': num_faces,
-            'faces_detail': faces_detail,
-            'video_url': f'/uploads/{unique_name}',
-        })
-
-        # Now generate processed video (results already visible to client)
-        logger.info('[Job %s] Starting video processing', job_id)
-        processed_name = f"processed_{unique_name}"
-        processed_path = os.path.join(app.config['UPLOAD_FOLDER'], processed_name)
-        create_processed_video(filepath, processed_path)
-
-        logger.info('[Job %s] Video processing done', job_id)
-        jobs[job_id].update({
-            'status': 'done',
-            'processed_url': f'/uploads/{processed_name}',
-        })
-    except Exception as e:
-        logger.error('[Job %s] Error: %s', job_id, e)
-        jobs[job_id].update({'status': 'done', 'error': str(e)})
-
-
-@app.route('/predict', methods=['POST'])
-def predict():
-    if 'video' not in request.files:
-        return jsonify({'error': 'No video file uploaded.'}), 400
-
-    file = request.files['video']
-    if file.filename == '':
-        return jsonify({'error': 'No file selected.'}), 400
-
-    if not allowed_file(file.filename):
-        return jsonify({'error': 'Invalid file type. Allowed: mp4, avi, mov, mkv, wmv'}), 400
-
-    cleanup_old_uploads()
-
-    ext = secure_filename(file.filename).rsplit('.', 1)[1].lower()
-    unique_name = f"{uuid.uuid4().hex}.{ext}"
-    filepath = os.path.join(app.config['UPLOAD_FOLDER'], unique_name)
-    file.save(filepath)
-    logger.info('Video uploaded: %s (%s)', file.filename, unique_name)
-
-    # Re-encode upload to H.264 so browser can play it
-    logger.info('Re-encoding uploaded video to H.264')
-    reencode_to_h264(filepath)
-
-    job_id = uuid.uuid4().hex
-    logger.info('Created job %s for %s', job_id, unique_name)
-    jobs[job_id] = {'status': 'uploading', 'video_url': f'/uploads/{unique_name}'}
-
-    thread = threading.Thread(target=process_video_job, args=(job_id, filepath, unique_name))
-    thread.start()
-
-    return jsonify({'job_id': job_id, 'video_url': f'/uploads/{unique_name}'})
-
-
-@app.route('/status/<job_id>')
-def job_status(job_id):
-    job = jobs.get(job_id)
-    if not job:
-        return jsonify({'error': 'Job not found'}), 404
-    return jsonify(job)
+from route import routes
+app.register_blueprint(routes)
 
 
 if __name__ == '__main__':
     logger.info('Starting Flask server on http://0.0.0.0:5000')
-    app.run(debug=True, host='0.0.0.0', port=5000)
+    app.run(debug=False, host='0.0.0.0', port=5000)
