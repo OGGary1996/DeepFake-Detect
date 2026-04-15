@@ -45,7 +45,8 @@ ALLOWED_EXTENSIONS = {'mp4', 'avi', 'mov', 'mkv', 'wmv'}
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 
 # Load the trained model
-MODEL_PATH = os.path.join(os.path.dirname(__file__), '..', 'tmp_checkpoint', 'best_model.keras')
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+MODEL_PATH = os.path.join(PROJECT_ROOT, 'tmp_checkpoint', 'best_model.keras')
 logger.info('Loading model from %s', MODEL_PATH)
 model = load_model(MODEL_PATH)
 logger.info('Model loaded successfully')

@@ -152,7 +152,9 @@ with tf.device(TRAINING_DEVICE):
     model.add(Dense(units = 1, activation = 'sigmoid'))
     model.summary()
 
-checkpoint_filepath = '.\\tmp_checkpoint'
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+checkpoint_filepath = os.path.join(PROJECT_ROOT, 'tmp_checkpoint')
+final_model_path = os.path.join(checkpoint_filepath, 'best_model.keras')
 print('Creating Directory: ' + checkpoint_filepath)
 os.makedirs(checkpoint_filepath, exist_ok=True)
 
@@ -225,7 +227,7 @@ phase2_callbacks = [
         restore_best_weights = True
     ),
     ModelCheckpoint(
-        filepath = os.path.join(checkpoint_filepath, 'best_model.keras'),
+        filepath = final_model_path,
         monitor = 'val_loss',
         mode = 'min',
         verbose = 1,
@@ -253,10 +255,10 @@ with tf.device(TRAINING_DEVICE):
 
 # Load the best model from Phase 2
 with tf.device(TRAINING_DEVICE):
-    best_model = load_model(os.path.join(checkpoint_filepath, 'best_model.keras'))
+    best_model = load_model(final_model_path)
 
 # Also save a copy for the app
-best_model.save('best_model.keras')
+best_model.save(final_model_path)
 
 # Evaluate on test set
 print('\n=== Evaluation on Test Set ===')
