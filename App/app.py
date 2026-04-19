@@ -7,13 +7,13 @@ import cv2
 import numpy as np
 import imageio_ffmpeg
 from mtcnn import MTCNN
-from ultralytics import YOLO
 from flask import Flask
 from tensorflow.keras.models import load_model
 from tensorflow.keras.applications.efficientnet import preprocess_input
 import keras.src.layers.normalization.batch_normalization as _bn_module
 
 import sys
+from config import preview_face_detector_enabled, resolve_server_port
 
 logging.basicConfig(
     level=logging.INFO,
@@ -76,10 +76,27 @@ mtcnn_detector = MTCNN()
 logger.info('MTCNN face detector ready')
 
 # Initialize YOLO face detector (for processed video overlay only)
-logger.info('Initializing YOLO face detector')
 FACE_MODEL_PATH = os.path.join(os.path.dirname(__file__), 'yolov8n-face.pt')
-face_detector = YOLO(FACE_MODEL_PATH)
-logger.info('YOLO face detector ready')
+
+
+def build_preview_face_detector():
+    if not preview_face_detector_enabled():
+        logger.info('Preview face detector disabled by configuration')
+        return None
+
+    try:
+        from ultralytics import YOLO
+    except ImportError:
+        logger.warning('ultralytics is unavailable; processed preview will fall back to the uploaded video')
+        return None
+
+    logger.info('Initializing YOLO face detector')
+    detector = YOLO(FACE_MODEL_PATH)
+    logger.info('YOLO face detector ready')
+    return detector
+
+
+face_detector = build_preview_face_detector()
 
 # In-memory job store: job_id -> {status, result, ...}
 jobs = {}
@@ -195,6 +212,11 @@ def extract_faces_from_video(video_path):
 def create_processed_video(video_path, output_path, face_scores=None):
     """Create video with face bounding boxes using ffmpeg drawbox (much faster than OpenCV)."""
     logger.info('Creating processed video with bounding boxes: %s', output_path)
+
+    if face_detector is None:
+        logger.info('Preview face detector unavailable; re-encoding original video without overlays')
+        reencode_to_h264(video_path, output_path)
+        return
 
     cap = cv2.VideoCapture(video_path)
     fps = cap.get(cv2.CAP_PROP_FPS) or 30
@@ -327,5 +349,6 @@ app.register_blueprint(routes)
 
 
 if __name__ == '__main__':
-    logger.info('Starting Flask server on http://0.0.0.0:5000')
-    app.run(debug=False, host='0.0.0.0', port=5000)
+    port = resolve_server_port()
+    logger.info('Starting Flask server on http://0.0.0.0:%s', port)
+    app.run(debug=False, host='0.0.0.0', port=port)

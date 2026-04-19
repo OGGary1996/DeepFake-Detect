@@ -1,3 +1,13 @@
+---
+title: DeepFake Detect
+emoji: 🎭
+colorFrom: red
+colorTo: gray
+sdk: docker
+app_port: 7860
+short_description: Face-level deepfake video detection with a Docker-based web app.
+---
+
 # DeepFake-Detect
 
 A Python-based deepfake video detection project with two main parts:
@@ -237,7 +247,62 @@ uv run python App/app.py
 Then open:
 
 ```text
-http://127.0.0.1:5000
+http://127.0.0.1:5001
+```
+
+The app now defaults to port `5001`. You can override it with an environment variable:
+
+```bash
+PORT=5050 uv run python App/app.py
+```
+
+## Hugging Face Spaces Deployment
+
+This repository is now prepared for a Docker-based Hugging Face Space.
+
+Deployment files:
+
+- [Dockerfile](/Users/zhangke/Documents/Projects/DeepFake-Detect/Dockerfile)
+- [.dockerignore](/Users/zhangke/Documents/Projects/DeepFake-Detect/.dockerignore)
+- [requirements.txt](/Users/zhangke/Documents/Projects/DeepFake-Detect/requirements.txt)
+
+The Space configuration is defined in the YAML header at the top of this README:
+
+- `sdk: docker`
+- `app_port: 7860`
+
+Container runtime behavior:
+
+- The container runs the Flask app with `python App/app.py`
+- The Docker image sets `PORT=7860`
+- The Docker image sets `ENABLE_PREVIEW_FACE_DETECTOR=0`
+- The app itself already supports `PORT`, so it matches Hugging Face Spaces routing
+
+Recommended deployment steps:
+
+1. Create a new Hugging Face Space and choose `Docker` as the SDK.
+2. Push this repository to that Space repository.
+3. Wait for the image build to complete.
+4. Open the Space once the container becomes healthy.
+
+Notes for this project on Spaces:
+
+- The Docker build excludes local training data and the duplicate root-level `best_model.keras` from the build context.
+- The canonical runtime model remains `tmp_checkpoint/best_model.keras`.
+- The app uses CPU by default unless you assign GPU hardware to the Space.
+- To keep the Docker image smaller and easier to build, the Space disables YOLO-based preview overlays by default and falls back to a re-encoded original video.
+
+Local Docker smoke test:
+
+```bash
+docker build -t deepfake-detect-space .
+docker run --rm -p 7860:7860 deepfake-detect-space
+```
+
+Then open:
+
+```text
+http://127.0.0.1:7860
 ```
 
 ## Training Order
