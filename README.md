@@ -5,7 +5,7 @@ colorFrom: red
 colorTo: gray
 sdk: docker
 app_port: 7860
-short_description: Face-level deepfake video detection with a Docker-based web app.
+short_description: Face-level deepfake detection web app.
 ---
 
 # DeepFake-Detect
