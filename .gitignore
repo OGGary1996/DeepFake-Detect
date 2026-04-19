@@ -133,6 +133,9 @@ dmypy.json
 
 #temp dataset folders
 tmp_*/
+!tmp_checkpoint/
+!tmp_checkpoint/best_model.keras
+!tmp_checkpoint/best_model_phase1.keras
 mtcnn/
 /.conda
 /train_sample_videos

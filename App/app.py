@@ -44,9 +44,26 @@ ALLOWED_EXTENSIONS = {'mp4', 'avi', 'mov', 'mkv', 'wmv'}
 
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 
-# Load the trained model
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-MODEL_PATH = os.path.join(PROJECT_ROOT, 'tmp_checkpoint', 'best_model.keras')
+
+
+def resolve_model_path():
+    """Prefer the canonical training output, but tolerate the legacy root copy."""
+    candidates = [
+        os.path.join(PROJECT_ROOT, 'tmp_checkpoint', 'best_model.keras'),
+        os.path.join(PROJECT_ROOT, 'best_model.keras'),
+    ]
+    for candidate in candidates:
+        if os.path.isfile(candidate):
+            return candidate
+    raise FileNotFoundError(
+        'No model file found. Expected one of: '
+        + ', '.join(candidates)
+    )
+
+
+# Load the trained model
+MODEL_PATH = resolve_model_path()
 logger.info('Loading model from %s', MODEL_PATH)
 model = load_model(MODEL_PATH)
 logger.info('Model loaded successfully')
